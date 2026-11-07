@@ -90,6 +90,42 @@ Claude 委托 Codex 的完整规则、Skill 和参数调用脚本见[浏览器�
 
 通道和中台共用一个 Node 进程，外部调用应异步等待。内置飞书通道的用户查询、发送和更新均异步调用 CLI，发送期间中台仍能接收事件和心跳。
 
+### 只收消息的通道：飞书收件（feishu-in）
+
+内置 [plugins/feishu-in/channel.ts](../plugins/feishu-in/channel.ts) 把发到机器人私聊的文字变成事件：私聊是一条需求，监听列表里群的告警推送也是一条事件。它不投卡片，只收消息；心跳照常，误入的卡片报失败。事件用它自己的来源密钥走 `POST /v1/events`，和任何外部来源同一条路，中台不认识飞书。
+
+除了卡片回传交互，开发者后台还要给应用订阅 `im.message.receive_v1` 事件（长连接）并开对应的机器人权限。卡片点击和收消息是两条流，同一个应用都只能有一个监听，只在一台电脑上跑。
+
+```jsonc
+// rules.json
+"sources": { "feishu-in": { "name": "飞书需求" } },
+"channels": { "feishu-in": { "name": "飞书收件", "answerers": ["ou_…"] } },
+"rules": [{
+  "name": "飞书提需求",
+  "when": { "source": "feishu-in", "types": ["request.*"] },
+  "to": "claude", "cwd": "~/code/project", "skill": "dev-flow",
+  "parallel": 2,   // 按发送人分事项，互不排队
+  "resume": true,  // 同一发送人的追问接着上一轮的会话
+}]
+
+// config.json 的 channels
+{ "feishu-in": { "key": "通道密钥", "lark": "<lark-cli 绝对路径>",
+  "url": "http://127.0.0.1:3350", "sourceKey": "<来源密钥>",
+  "users": ["ou_…"], "alerts": ["oc_告警群"],
+  "whitelist": "<白名单json绝对路径>", "discover": true } }
+```
+
+| 选项 | 作用 |
+|---|---|
+| `url`、`sourceKey` | 必填。中台地址和来源 `feishu-in` 的密钥（`agent-autoloop key new source feishu-in`） |
+| `users` | 私聊白名单（open_id）。没配时一条私聊都不收；名单外的人发消息只记日志 |
+| `alerts` | 要收告警的群 chat_id，群消息变成 `alert.report` 事件 |
+| `whitelist` | JSON 字符串数组文件；告警文本包含其中任一条就不派。每次都重读，改文件即生效 |
+| `discover` | 把不认识的消息形状和没监听的群记进日志，用来摸 chat_id |
+| `lark` | lark-cli 路径，默认 PATH 里的 `lark-cli` |
+
+私聊事件是 `request.new`，`subject` 是发送人的 open_id。规则写了 `resume` 时，同一发送人的追问接着上一轮的会话；单独发一条 `/new` 不发事件，只把这个人切到新事项——下一条消息开新会话，旧会话留在轮次历史里（`agent-autoloop status` 的轮次列表）。群告警是 `alert.report`，`subject` 是群 chat_id。
+
 ## 事件插件
 
 从 [hello-source/source.ts](../examples/plugins/hello-source/source.ts) 开始。它检查 `x-shop-signature` 中的 HMAC-SHA256，再把订单变成事件。
