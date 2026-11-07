@@ -45,6 +45,8 @@ function messageOf(raw: any): { chatId: string; messageId: string; chatType: str
 
 /** The sender's open id, again from whatever shape this version streams. A miss means "not on the list". */
 function senderOf(raw: any): string | null {
+  // lark-cli's event consume flattens the envelope and keeps only `sender_id` at the top level.
+  if (typeof raw?.sender_id === "string" && raw.sender_id) return raw.sender_id;
   const sender = raw?.event?.sender ?? raw?.sender;
   const id = sender?.sender_id?.open_id ?? sender?.sender_id?.user_id ?? sender?.open_id ?? sender?.id;
   return typeof id === "string" && id ? id : typeof sender === "string" && sender ? sender : null;

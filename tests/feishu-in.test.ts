@@ -3,7 +3,8 @@
 // across a restart so the next words land back in the old matter; an event goes out without the source key; a watched
 // group's alert that the whitelist catches is still dispatched, or one it doesn't catch is dropped; a message this
 // plugin can't read is taken as a request anyway; a card misrouted into this channel waits forever instead of being
-// failed, so presence dies with it.
+// failed, so presence dies with it; lark-cli's flattened event line hides the sender, so a listed user's chat is
+// dropped as unidentifiable.
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
@@ -38,6 +39,17 @@ function group(messageId: string, chatId: string, text: string) {
       sender: { sender_id: { open_id: "ou_anyone" } },
       message: { chat_id: chatId, message_id: messageId, chat_type: "group", content: JSON.stringify({ text }) },
     },
+  });
+}
+
+/** A private-chat message line as lark-cli's flattened stream frames it: top-level fields, and `sender_id` alone. */
+function flat(messageId: string, sender: string, text: string) {
+  return JSON.stringify({
+    chat_id: `oc_${sender}`,
+    message_id: messageId,
+    chat_type: "p2p",
+    sender_id: sender,
+    content: JSON.stringify({ text }),
   });
 }
 
@@ -147,6 +159,20 @@ test("a listed user's private chat becomes a request; a stranger's doesn't; a lo
     "a stranger's chat is said, not swallowed",
   );
   assert.ok(readFileSync(`${program}.log`, "utf8").includes("im.message.receive_v1"), "subscribes to messages");
+});
+
+test("lark-cli's flattened event line still finds the sender and makes the request", async () => {
+  const { seen } = await run(
+    { lark: lark("lark-flat", [flat("om_1", "ou_me", "拍平的私聊")]), sourceKey: "sk", users: ["ou_me"] },
+    1,
+  );
+  assert.deepEqual(seen[0].body, {
+    id: "req-om_1",
+    type: "request.new",
+    subject: "ou_me",
+    summary: "拍平的私聊",
+    detail: "拍平的私聊",
+  });
 });
 
 test("no list configured blocks every private chat", async () => {
