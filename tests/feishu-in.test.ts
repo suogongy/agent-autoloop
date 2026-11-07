@@ -4,7 +4,8 @@
 // group's alert that the whitelist catches is still dispatched, or one it doesn't catch is dropped; a message this
 // plugin can't read is taken as a request anyway; a card misrouted into this channel waits forever instead of being
 // failed, so presence dies with it; lark-cli's flattened event line hides the sender, so a listed user's chat is
-// dropped as unidentifiable.
+// dropped as unidentifiable; a human's chatter or a reply without @bot in a watched group is dispatched; a reply
+// loses the quoted alert; every alert in a group lands in one matter so alerts bleed into each other.
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
@@ -32,15 +33,23 @@ function dm(messageId: string, sender: string, text: string) {
   });
 }
 
-/** A group-chat message line. */
-function group(messageId: string, chatId: string, text: string) {
+/** A group-chat message line; extra fields carry what lark-cli flattens: sender_type, parent_id and mentions. */
+function group(messageId: string, chatId: string, text: string, extra: Record<string, unknown> = {}) {
   return JSON.stringify({
-    event: {
-      sender: { sender_id: { open_id: "ou_anyone" } },
-      message: { chat_id: chatId, message_id: messageId, chat_type: "group", content: JSON.stringify({ text }) },
-    },
+    chat_id: chatId,
+    message_id: messageId,
+    chat_type: "group",
+    sender_id: "ou_human",
+    sender_type: "user",
+    content: JSON.stringify({ text }),
+    ...extra,
   });
 }
+
+const asApp = { sender_id: "ou_pusher", sender_type: "app" };
+const atBot = { mentions: [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "bot" }] };
+const atOther = { mentions: [{ key: "@_user_1", id: { open_id: "ou_other" }, name: "someone" }] };
+const replying = (parent: string) => ({ parent_id: parent });
 
 /** A private-chat message line as lark-cli's flattened stream frames it: top-level fields, and `sender_id` alone. */
 function flat(messageId: string, sender: string, text: string) {
@@ -66,6 +75,13 @@ appendFileSync(${JSON.stringify(log)}, args + "\\n");
 if (args.includes("event consume")) {
   for (const line of ${JSON.stringify(lines)}) console.log(line);
   setInterval(() => {}, 1000);
+} else if (args.includes("bot/v3/info")) {
+  console.log(JSON.stringify({ ok: true, data: { open_id: "ou_bot" } }));
+} else if (args.includes("+messages-mget")) {
+  const id = (args.match(/--message-ids (\\S+)/) || [])[1] ?? "";
+  console.log(
+    JSON.stringify({ ok: true, data: { messages: [{ message_id: id, msg_type: "text", content: "被引用的原始告警日志" }] } }),
+  );
 } else {
   for await (const chunk of process.stdin) {}
   console.log(JSON.stringify({ ok: true }));
@@ -218,15 +234,15 @@ test("/new starts a fresh matter, and the epoch survives a restart", async () =>
   );
 });
 
-test("a watched group's alert passes unless the whitelist catches it; other groups are ignored", async () => {
+test("an app's push in a watched group is an alert on its own subject; the whitelist catches fresh ones; other groups are ignored", async () => {
   const whitelist = join(dir, "wl.json");
   writeFileSync(whitelist, JSON.stringify(["磁盘已恢复"]));
   const { seen } = await run(
     {
       lark: lark("lark-groups", [
-        group("om_1", "oc_g1", "CPU 100%"),
-        group("om_2", "oc_g1", "磁盘已恢复"),
-        group("om_3", "oc_g2", "别的群"),
+        group("om_1", "oc_g1", "CPU 100%", asApp),
+        group("om_2", "oc_g1", "磁盘已恢复", asApp),
+        group("om_3", "oc_g2", "别的群", asApp),
       ]),
       sourceKey: "sk",
       users: ["ou_me"],
@@ -238,10 +254,54 @@ test("a watched group's alert passes unless the whitelist catches it; other grou
   assert.deepEqual(seen[0].body, {
     id: "alert-om_1",
     type: "alert.report",
-    subject: "oc_g1",
+    subject: "oc_g1-om_1",
     summary: "CPU 100%",
     detail: "CPU 100%",
   });
+});
+
+test("a human's group message is only taken when it @s the bot", async () => {
+  const { seen } = await run(
+    {
+      lark: lark("lark-at", [
+        group("om_1", "oc_g1", "同事在闲聊"),
+        group("om_2", "oc_g1", "帮我看看这条", atBot),
+        group("om_3", "oc_g1", "艾特了别人", atOther),
+        group("om_4", "oc_g1", "回复但没艾特", replying("om_1")),
+      ]),
+      sourceKey: "sk",
+      users: ["ou_me"],
+      alerts: ["oc_g1"],
+    },
+    1,
+  );
+  assert.deepEqual(
+    seen.map((s) => s.body.subject),
+    ["oc_g1-om_2"],
+    "chatter, @someone-else and an un-at reply are left alone",
+  );
+  assert.deepEqual(seen[0].body.id, "alert-om_2");
+});
+
+test("a reply that @s the bot carries the quoted message and lands in the quoted alert's matter, past the whitelist", async () => {
+  const whitelist = join(dir, "wl-reply.json");
+  writeFileSync(whitelist, JSON.stringify(["磁盘已恢复"]));
+  const { seen } = await run(
+    {
+      lark: lark("lark-reply", [
+        group("om_1", "oc_g1", "磁盘已恢复，再看下当时为什么盘满", { ...atBot, ...replying("om_0") }),
+      ]),
+      sourceKey: "sk",
+      users: ["ou_me"],
+      alerts: ["oc_g1"],
+      whitelist,
+    },
+    1,
+  );
+  assert.deepEqual(seen[0].body.subject, "oc_g1-om_0", "the reply joins the quoted message's matter");
+  assert.ok(seen[0].body.detail.includes("被引用的原始告警日志"), "the quoted text rides along");
+  assert.ok(seen[0].body.detail.includes("磁盘已恢复"), "so does what the human said");
+  assert.ok(!seen[0].body.summary.startsWith("被引用"), "the summary is the human's words");
 });
 
 test("a message the plugin can't read is logged under discover, not taken as a request", async () => {

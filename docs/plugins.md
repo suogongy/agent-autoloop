@@ -92,7 +92,7 @@ Claude 委托 Codex 的完整规则、Skill 和参数调用脚本见[浏览器�
 
 ### 只收消息的通道：飞书收件（feishu-in）
 
-内置 [plugins/feishu-in/channel.ts](../plugins/feishu-in/channel.ts) 把发到机器人私聊的文字变成事件：私聊是一条需求，监听列表里群的告警推送也是一条事件。它不投卡片，只收消息；心跳照常，误入的卡片报失败。事件用它自己的来源密钥走 `POST /v1/events`，和任何外部来源同一条路，中台不认识飞书。
+内置 [plugins/feishu-in/channel.ts](../plugins/feishu-in/channel.ts) 把发到机器人私聊的文字变成事件：私聊是一条需求，监听列表里群的告警推送也是一条事件。它不投卡片，只收消息；心跳照常，误入的卡片报失败。事件用它自己的来源密钥走 `POST /v1/events`，和任何外部来源同一条路，中台不认识飞书。群消息只收两类：应用推送的告警（各自独立事项），和 @了机器人的消息；人的其他话不派。回复机器人并引用某条消息时，事件带上被引用消息的原文，并落进被引用消息的事项——追问和原告警同一个会话。
 
 除了卡片回传交互，开发者后台还要给应用订阅 `im.message.receive_v1` 事件（长连接）并开对应的机器人权限。卡片点击和收消息是两条流，同一个应用都只能有一个监听，只在一台电脑上跑。
 
@@ -124,7 +124,7 @@ Claude 委托 Codex 的完整规则、Skill 和参数调用脚本见[浏览器�
 | `discover` | 把不认识的消息形状和没监听的群记进日志，用来摸 chat_id |
 | `lark` | lark-cli 路径，默认 PATH 里的 `lark-cli` |
 
-私聊事件是 `request.new`，`subject` 是发送人的 open_id。规则写了 `resume` 时，同一发送人的追问接着上一轮的会话；单独发一条 `/new` 不发事件，只把这个人切到新事项——下一条消息开新会话，旧会话留在轮次历史里（`agent-autoloop status` 的轮次列表）。群告警是 `alert.report`，`subject` 是群 chat_id。
+私聊事件是 `request.new`，`subject` 是发送人的 open_id。规则写了 `resume` 时，同一发送人的追问接着上一轮的会话；单独发一条 `/new` 不发事件，只把这个人切到新事项——下一条消息开新会话，旧会话留在轮次历史里（`agent-autoloop status` 的轮次列表）。群告警是 `alert.report`，每条独立事项：`subject` 是 `群chat_id-消息id`；引用回复落进 `群chat_id-被引用消息id`，和原告警同事项。
 
 ## 事件插件
 

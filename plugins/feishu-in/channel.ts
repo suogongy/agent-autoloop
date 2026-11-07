@@ -52,6 +52,22 @@ function senderOf(raw: any): string | null {
   return typeof id === "string" && id ? id : typeof sender === "string" && sender ? sender : null;
 }
 
+/** The @ entries the event carries, from whatever shape this version streams. */
+function mentionsOf(raw: any): any[] {
+  const list = raw?.mentions ?? raw?.event?.mentions ?? null;
+  if (typeof list === "string") return safeJson(list) ?? [];
+  return Array.isArray(list) ? list : [];
+}
+
+/** Whether one of the @ entries is the bot itself. */
+function atBot(raw: any, botId: string | null): boolean {
+  if (!botId) return false;
+  return mentionsOf(raw).some((mention) => {
+    const id = mention?.id?.open_id ?? mention?.id?.user_id ?? mention?.open_id ?? mention?.id;
+    return id === botId;
+  });
+}
+
 /** A wait that a stop cuts short, so shutdown doesn't linger in a sleep. */
 const sleep = (ms: number, signal: AbortSignal) =>
   new Promise<void>((resolve) => {
@@ -119,6 +135,39 @@ export default async function feishuIn({ hub, options, log, signal }: ChannelCon
     }
   };
 
+  /** Runs the lark CLI once and parses its JSON reply; anything that goes wrong just yields null. */
+  const askLark = (args: string[]): Promise<any | null> =>
+    new Promise((resolve) => {
+      const child = spawn(...commandLine([program, ...args]), {
+        stdio: ["pipe", "pipe", "pipe"],
+        signal: AbortSignal.timeout(20_000),
+      });
+      let out = "";
+      child.stdout!.on("data", (chunk: Buffer) => (out += chunk));
+      child.on("error", () => resolve(null));
+      child.on("close", () => {
+        try {
+          const reply = JSON.parse(out);
+          resolve(reply?.ok ? reply : null);
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+
+  // Human messages in a watched group only count when they @ the bot, so the bot needs its own open id. Resolved
+  // once, on the first group message that needs it; until it answers, human messages are left alone.
+  let botId: Promise<string | null> | undefined;
+  const botIdOf = () =>
+    (botId ??= askLark(["api", "get", "/bot/v3/info", "--as", "bot"]).then((reply) => reply?.data?.open_id ?? null));
+
+  /** The quoted message's words, fetched by id; a miss (deleted, too slow, unknown shape) means no quote rides along. */
+  const quotedOf = async (parentId: string): Promise<string | null> => {
+    const reply = await askLark(["im", "+messages-mget", "--message-ids", parentId, "--as", "bot"]);
+    const text = reply?.data?.messages?.[0]?.content;
+    return typeof text === "string" && text ? text.slice(0, 2000) : null;
+  };
+
   const handle = async (line: string) => {
     let raw: any;
     try {
@@ -167,18 +216,38 @@ export default async function feishuIn({ hub, options, log, signal }: ChannelCon
       );
     } else if (alerts.includes(chatId)) {
       if (!text) return;
-      if (whitelistOf().some((word) => text.toLowerCase().includes(word.toLowerCase()))) {
+      // An app's push is an alert as it is; a human's word only counts when it @s the bot, so chatter stays quiet.
+      // A reply lands in the quoted message's matter and carries the quoted words — the alert's real context — and
+      // being explicit intent, it passes the whitelist. A fresh alert is its own matter: one subject per message.
+      const senderType = raw?.sender_type ?? raw?.event?.sender_type ?? "";
+      const parentRaw = raw?.parent_id ?? raw?.event?.parent_id;
+      const parentId = typeof parentRaw === "string" && parentRaw ? parentRaw : null;
+      if (senderType !== "app") {
+        const bot = await botIdOf();
+        if (!bot) {
+          log("认不出机器人自己的 open_id（bot/v3/info 没成），人的群消息先不派，只收应用推送");
+          return;
+        }
+        if (!atBot(raw, bot)) {
+          if (discover) log(`群消息没艾特机器人，不派：chat_id=${chatId} ${text.slice(0, 60)}`);
+          return;
+        }
+      }
+      const quoted = parentId ? await quotedOf(parentId) : null;
+      if (!parentId && whitelistOf().some((word) => text.toLowerCase().includes(word.toLowerCase()))) {
         log(`告警命中白名单，不派：${text.slice(0, 80)}`);
         return;
       }
       const made = await emit({
         id: `alert-${messageId}`,
         type: "alert.report",
-        subject: chatId,
-        summary: text.slice(0, 200),
-        detail: text.slice(0, 4000),
+        subject: parentId ? `${chatId}-${parentId}` : `${chatId}-${messageId}`,
+        summary: (text || quoted || "").slice(0, 200),
+        detail: (quoted ? `【引用的消息】${quoted}\n【本次消息】${text}` : text).slice(0, 4000),
       });
-      log(`告警 → 事件 ${made.event}${made.duplicate ? "（重复，已略）" : ""}：${text.slice(0, 60)}`);
+      log(
+        `告警 → 事件 ${made.event}${made.duplicate ? "（重复，已略）" : ""}（subject ${parentId ? "引用消息的事项" : "独立新事项"}）：${text.slice(0, 60)}`,
+      );
     } else if (discover) {
       log(`discover chat_id=${chatId} chat_type=${chatType || "?"}：${text.slice(0, 120) || line.slice(0, 200)}`);
     }
